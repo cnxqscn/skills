@@ -1,0 +1,326 @@
+#!/bin/bash
+# ============================================================
+# OpenClaw Agent 的 Claude Code 启动脚本 (模板)
+# 支持: -m 模型选择, -p 提示词, -s session名称, -l 读取日志
+# 默认在 tmux 中后台运行
+#
+# 配置方式：
+#   1. 安装 Claude Code: curl -fsSL https://claude.ai/install.sh | bash
+#   2. 安装 tmux
+#   3. cp claude.sh.template claude.sh && chmod +x claude.sh
+#   4. 设置对应模型的 API Key 环境变量
+# ============================================================
+
+# 默认配置
+MODEL="kimi"  # 默认模型
+PROMPT=""
+WORKDIR="${CLAUDE_WORKSPACE:-$(pwd)}"
+# 注意：使用 -p/--print 模式时，Claude Code 会自动跳过权限确认
+TMUX_SESSION=""
+READ_LOG=false
+
+# 可自定义的用户主目录（用于tmux环境）
+TMUX_HOME="${CLAUDE_TMUX_HOME:-$HOME}"
+
+# 显示帮助
+show_help() {
+    cat << EOF
+Usage: ./claude.sh [OPTIONS]
+
+Options:
+    -m, --model MODEL      选择模型: kimi(默认) | minimax | glm5
+    -p, --prompt PROMPT    指定提示词 (必需)
+    -s, --session NAME     指定 tmux session 名称（默认自动）
+    -l, --log              读取 tmux session 的日志
+    -h, --help             显示帮助
+
+支持的模型及环境变量:
+
+    kimi (-m kimi)
+        环境变量: KIMI_API_KEY
+        模型: kimi-for-coding
+        Base URL: https://api.kimi.com/coding/
+        官网: https://platform.moonshot.cn/
+
+    minimax (-m minimax)
+        环境变量: MINIMAX_API_KEY
+        模型: MiniMax-M2.5
+        Base URL: https://api.minimaxi.com/anthropic
+        官网: https://www.minimaxi.com/
+
+    glm5 (-m glm5)
+        环境变量: Z_AI_API_KEY
+        模型: GLM-5
+        Base URL: https://api.z.ai/api/anthropic
+        官网: https://www.z.ai/
+
+配置示例:
+    export KIMI_API_KEY="sk-your-kimi-key"
+    export MINIMAX_API_KEY="sk-your-minimax-key"
+    export Z_AI_API_KEY="your-z-ai-key"
+
+使用示例:
+    ./claude.sh -m kimi -p "修复这个bug"              # 后台运行
+    ./claude.sh -m glm5 -p "检查代码" -s mytask       # 指定session名
+    ./claude.sh -l                                     # 读取日志
+
+日志位置: /tmp/tmux-logs/<session>-<timestamp>.log
+EOF
+}
+
+# 解析参数
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -m|--model)
+            MODEL="$2"
+            shift 2
+            ;;
+        -p|--prompt)
+            PROMPT="$2"
+            shift 2
+            ;;
+        -s|--session)
+            TMUX_SESSION="$2"
+            shift 2
+            ;;
+        -l|--log)
+            READ_LOG=true
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "未知参数: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# 读取日志模式
+if $READ_LOG; then
+    if [[ -z "$TMUX_SESSION" ]]; then
+        TMUX_SESSION=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^claude-" | tail -1)
+        if [[ -z "$TMUX_SESSION" ]]; then
+            echo "错误: 没有找到 claude tmux session"
+            tmux list-sessions 2>/dev/null || echo "  (无)"
+            exit 1
+        fi
+    fi
+
+    # 查找该 session 最新的日志文件（带时间戳格式）
+    LOG_FILE=$(ls -t /tmp/tmux-logs/${TMUX_SESSION}-*.log 2>/dev/null | head -1)
+
+    echo "=== 读取 tmux session: $TMUX_SESSION ==="
+
+    if [[ -n "$LOG_FILE" && -f "$LOG_FILE" ]]; then
+        echo "日志文件: $LOG_FILE"
+        echo "=========================================="
+        tail -n 1000 "$LOG_FILE"
+    else
+        echo "日志文件: (未找到)"
+        echo "=========================================="
+        echo "警告: 未找到日志文件，尝试从 tmux 捕获..."
+        tmux capture-pane -t "$TMUX_SESSION" -p 2>/dev/null || echo "无法捕获 tmux 内容"
+    fi
+
+    echo ""
+    echo "=== Session 状态 ==="
+    tmux list-sessions | grep "$TMUX_SESSION" || echo "Session 已结束"
+    exit 0
+fi
+
+# 生成 session 名称
+if [[ -z "$TMUX_SESSION" ]]; then
+    TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+    TMUX_SESSION="claude-${TIMESTAMP}"
+fi
+
+# 确保工作目录存在
+mkdir -p "$WORKDIR"
+cd "$WORKDIR" || exit 1
+
+# 创建 CLAUDE.md（如果不存在）
+if [[ ! -f "CLAUDE.md" ]]; then
+    cat > CLAUDE.md << 'EOF'
+# CLAUDE.md - Agent 工作记忆
+
+## 角色
+- **Name**: Agent
+- **职责**: 根据任务执行相应工作
+
+## 当前任务
+(待更新)
+
+## 完成记录
+-
+EOF
+    echo "[初始化] 已创建 $WORKDIR/CLAUDE.md"
+fi
+
+# ============================================================
+# 检测 Claude Code 是否安装，并获取完整路径
+# ============================================================
+
+CLAUDE_BIN=$(command -v claude)
+
+if [[ -z "$CLAUDE_BIN" ]] || ! "$CLAUDE_BIN" --version &> /dev/null; then
+    echo "错误: Claude Code 未安装或无法运行"
+    echo ""
+    echo "安装步骤:"
+    echo "  curl -fsSL https://claude.ai/install.sh | bash"
+    echo ""
+    echo "安装完成后请重新运行此脚本"
+    exit 1
+fi
+
+echo "[检测] Claude Code 路径: $CLAUDE_BIN"
+
+# ============================================================
+# 模型配置
+# 默认提供: kimi | minimax | glm5
+# 内置默认模型名和 Base URL，只需要配置 API Key
+# ============================================================
+
+case $MODEL in
+    # 月之暗面 Kimi (Coding 版本)
+    # 官网: https://platform.moonshot.cn/
+    kimi|moonshot)
+        if [[ -z "${KIMI_API_KEY}" ]]; then
+            echo "错误: 使用 kimi 模型需要设置 KIMI_API_KEY 环境变量"
+            echo ""
+            echo "配置步骤:"
+            echo "  1. 访问 https://platform.moonshot.cn/ 获取 API Key"
+            echo "  2. 运行: export KIMI_API_KEY=\"your-api-key\""
+            exit 1
+        fi
+        export ANTHROPIC_AUTH_TOKEN="${KIMI_API_KEY}"
+        export ANTHROPIC_BASE_URL="https://api.kimi.com/coding/"
+        export ANTHROPIC_MODEL="kimi-for-coding"
+        export ANTHROPIC_SMALL_FAST_MODEL="kimi-for-coding"
+        export ANTHROPIC_DEFAULT_SONNET_MODEL="kimi-for-coding"
+        export ANTHROPIC_DEFAULT_HAIKU_MODEL="kimi-for-coding"
+        export ANTHROPIC_DEFAULT_OPUS_MODEL="kimi-for-coding"
+        echo "[模型] 月之暗面 Kimi Coding"
+        ;;
+
+    # MiniMax M2.5
+    # 官网: https://www.minimaxi.com/
+    minimax|m2.5)
+        if [[ -z "${MINIMAX_API_KEY}" ]]; then
+            echo "错误: 使用 minimax 模型需要设置 MINIMAX_API_KEY 环境变量"
+            echo ""
+            echo "配置步骤:"
+            echo "  1. 访问 https://www.minimaxi.com/ 获取 API Key"
+            echo "  2. 运行: export MINIMAX_API_KEY=\"your-api-key\""
+            exit 1
+        fi
+        export ANTHROPIC_AUTH_TOKEN="${MINIMAX_API_KEY}"
+        export ANTHROPIC_BASE_URL="https://api.minimaxi.com/anthropic"
+        export ANTHROPIC_MODEL="MiniMax-M2.5"
+        export ANTHROPIC_SMALL_FAST_MODEL="MiniMax-M2.5"
+        export ANTHROPIC_DEFAULT_SONNET_MODEL="MiniMax-M2.5"
+        export ANTHROPIC_DEFAULT_HAIKU_MODEL="MiniMax-M2.5"
+        export ANTHROPIC_DEFAULT_OPUS_MODEL="MiniMax-M2.5"
+        echo "[模型] MiniMax M2.5"
+        ;;
+
+    # 智谱 GLM-5
+    # 官网: https://www.z.ai/
+    glm5|zhipu|bigmodel)
+        if [[ -z "${Z_AI_API_KEY}" ]]; then
+            echo "错误: 使用 glm5 模型需要设置 Z_AI_API_KEY 环境变量"
+            echo ""
+            echo "配置步骤:"
+            echo "  1. 访问 https://www.z.ai/ 获取 API Key"
+            echo "  2. 运行: export Z_AI_API_KEY=\"your-api-key\""
+            exit 1
+        fi
+        export ANTHROPIC_AUTH_TOKEN="${Z_AI_API_KEY}"
+        export ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic"
+        export ANTHROPIC_MODEL="GLM-5"
+        export ANTHROPIC_SMALL_FAST_MODEL="GLM-5"
+        export ANTHROPIC_DEFAULT_SONNET_MODEL="GLM-5"
+        export ANTHROPIC_DEFAULT_HAIKU_MODEL="GLM-5"
+        export ANTHROPIC_DEFAULT_OPUS_MODEL="GLM-5"
+        echo "[模型] 智谱 GLM-5"
+        ;;
+
+    *)
+        echo "未知模型: $MODEL"
+        echo ""
+        echo "支持的模型: kimi | minimax | glm5"
+        echo "查看帮助: ./claude.sh --help"
+        exit 1
+        ;;
+esac
+
+# 检查提示词（tmux后台模式必需）
+if [[ -z "$PROMPT" ]]; then
+    echo "错误: 必须指定提示词 (-p)"
+    echo ""
+    echo "使用示例:"
+    echo "  ./claude.sh -m kimi -p \"检查代码中的bug\""
+    echo "  ./claude.sh -m glm5 -p \"优化性能\" -s mytask"
+    exit 1
+fi
+
+# 显示当前配置
+echo "[工作目录] $(pwd)"
+echo "[Session] $TMUX_SESSION"
+echo "[提示词] $PROMPT"
+
+# 构建 Claude 命令
+CLAUDE_CMD="$CLAUDE_BIN --print \"$PROMPT\""
+
+# 启动 tmux session
+# 日志文件加入随机时间戳，确保每次运行都是新的
+LOG_FILE="/tmp/tmux-logs/${TMUX_SESSION}-$(date +%s).log"
+
+echo "[启动] 在 tmux session '$TMUX_SESSION' 中运行..."
+echo "[日志] $LOG_FILE"
+
+# 创建日志目录（在发送命令前创建，确保tee能写入）
+mkdir -p "$(dirname "$LOG_FILE")"
+
+# 创建 tmux session，继承当前 PATH 和关键环境变量
+# 使用 -e 选项传递环境变量，确保子 shell 能继承
+tmux new-session -d -s "$TMUX_SESSION" -c "$WORKDIR" \
+    -e PATH="$PATH" \
+    -e HOME="$HOME"
+
+# 在 tmux 中设置必要的环境变量
+# 取消 CLAUDECODE 变量以允许在嵌套环境中运行
+tmux send-keys -t "$TMUX_SESSION" "unset CLAUDECODE" C-m
+tmux send-keys -t "$TMUX_SESSION" "export HOME='$TMUX_HOME'" C-m
+tmux send-keys -t "$TMUX_SESSION" "export ANTHROPIC_AUTH_TOKEN='$ANTHROPIC_AUTH_TOKEN'" C-m
+tmux send-keys -t "$TMUX_SESSION" "export ANTHROPIC_BASE_URL='$ANTHROPIC_BASE_URL'" C-m
+tmux send-keys -t "$TMUX_SESSION" "export ANTHROPIC_MODEL='$ANTHROPIC_MODEL'" C-m
+tmux send-keys -t "$TMUX_SESSION" "export ANTHROPIC_SMALL_FAST_MODEL='$ANTHROPIC_SMALL_FAST_MODEL'" C-m
+if [[ -n "$ANTHROPIC_DEFAULT_SONNET_MODEL" ]]; then
+    tmux send-keys -t "$TMUX_SESSION" "export ANTHROPIC_DEFAULT_SONNET_MODEL='$ANTHROPIC_DEFAULT_SONNET_MODEL'" C-m
+fi
+if [[ -n "$ANTHROPIC_DEFAULT_HAIKU_MODEL" ]]; then
+    tmux send-keys -t "$TMUX_SESSION" "export ANTHROPIC_DEFAULT_HAIKU_MODEL='$ANTHROPIC_DEFAULT_HAIKU_MODEL'" C-m
+fi
+if [[ -n "$ANTHROPIC_DEFAULT_OPUS_MODEL" ]]; then
+    tmux send-keys -t "$TMUX_SESSION" "export ANTHROPIC_DEFAULT_OPUS_MODEL='$ANTHROPIC_DEFAULT_OPUS_MODEL'" C-m
+fi
+tmux send-keys -t "$TMUX_SESSION" "cd $WORKDIR" C-m
+
+# 运行命令并记录日志
+tmux send-keys -t "$TMUX_SESSION" "$CLAUDE_CMD 2>&1 | tee $LOG_FILE" C-m
+
+echo ""
+echo "========================================"
+echo "Claude Code 已在 tmux 中启动"
+echo "Session: $TMUX_SESSION"
+echo "日志:    $LOG_FILE"
+echo ""
+echo "查看状态: tmux list-sessions"
+echo "附加:    tmux attach -t $TMUX_SESSION"
+echo "读取日志: ./claude.sh -l"
+echo "停止:    tmux kill-session -t $TMUX_SESSION"
+echo "========================================"
